@@ -16,6 +16,7 @@ from cog import BasePredictor, Input, Path, ConcatenateIterator
 import time
 import subprocess
 from threading import Thread
+from typing import List
 
 import os
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.getcwd() + "/weights"
@@ -59,7 +60,7 @@ def download_json(url: str, dest: Path):
     else:
         print(f"Failed to download {url}. Status code: {res.status_code}")
 
-def download_weights(baseurl: str, basedest: str, files: list[str]):
+def download_weights(baseurl: str, basedest: str, files: List[str]):
     basedest = Path(basedest)
     start = time.time()
     print("downloading to: ", basedest)
@@ -75,25 +76,25 @@ def download_weights(baseurl: str, basedest: str, files: list[str]):
                 subprocess.check_call(["pget", url, str(dest)], close_fds=False)
     print("downloading took: ", time.time() - start)
 
-class Predictor(BasePredictor):
-    def setup(self) -> None:
+class Predictor:
+    def setup(self, weights:dict=None) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
-        for weight in weights:
-            download_weights(weight["src"], weight["dest"], weight["files"])
+        if 0:
+            for weight in weights:
+                download_weights(weight["src"], weight["dest"], weight["files"])
         disable_torch_init()
-    
-        self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model("liuhaotian/llava-v1.5-13b", model_name="llava-v1.5-13b", model_base=None, load_8bit=False, load_4bit=False)
 
-    def predict(
-        self,
-        image: Path = Input(description="Input image"),
-        prompt: str = Input(description="Prompt to use for text generation"),
-        top_p: float = Input(description="When decoding text, samples from the top p percentage of most likely tokens; lower to ignore less likely tokens", ge=0.0, le=1.0, default=1.0),
-        temperature: float = Input(description="Adjusts randomness of outputs, greater than 1 is random and 0 is deterministic", default=0.2, ge=0.0),
-        max_tokens: int = Input(description="Maximum number of tokens to generate. A word is generally 2-3 tokens", default=1024, ge=0),
-    ) -> ConcatenateIterator[str]:
-        """Run a single prediction on the model"""
-    
+        if weights is None:
+            weights = {
+                'model_path': "/data/krishnas/repos/vdu-vlm/models/vdu-llm-llava/llava-v1.6-34b",
+                'model_name': "llava-v1.6-34b"
+            }
+        self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
+            **weights, 
+            model_base=None, load_8bit=False, load_4bit=True
+        )
+        
+    def pre_predict(self, image, prompt, return_dict=False, **kwargs):
         conv_mode = "llava_v1"
         conv = conv_templates[conv_mode].copy()
     
@@ -113,7 +114,26 @@ class Predictor(BasePredictor):
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
         keywords = [stop_str]
         streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, timeout=20.0)
+        if return_dict:
+            from torch_snippets import AD
+            return AD(
+                input_ids, stop_str, keywords, streamer, image_tensor, image_data, conv, conv_mode, inp, prompt
+            )
+        else:
+            return input_ids, stop_str, keywords, streamer, image_tensor, image_data, conv, conv_mode, inp, prompt
     
+
+    def predict(
+        self,
+        image: Path = Input(description="Input image"),
+        prompt: str = Input(description="Prompt to use for text generation"),
+        top_p: float = Input(description="When decoding text, samples from the top p percentage of most likely tokens; lower to ignore less likely tokens", ge=0.0, le=1.0, default=1.0),
+        temperature: float = Input(description="Adjusts randomness of outputs, greater than 1 is random and 0 is deterministic", default=0.2, ge=0.0),
+        max_tokens: int = Input(description="Maximum number of tokens to generate. A word is generally 2-3 tokens", default=1024, ge=0),
+    ) -> ConcatenateIterator[str]:
+        """Run a single prediction on the model"""
+        input_ids, stop_str, keywords, streamer, image_tensor, image_data, conv, conv_mode, inp, prompt = self.pre_predict(image, prompt, return_dict=False)
+
         with torch.inference_mode():
             thread = Thread(target=self.model.generate, kwargs=dict(
                 inputs=input_ids,
